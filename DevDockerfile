@@ -1,0 +1,190 @@
+# syntax=docker/dockerfile:1.7
+# Reusable multi-agent development container with:
+#   - Google Antigravity CLI (agy)
+#   - Claude Code CLI (claude)
+#   - OpenAI Codex CLI (codex)
+#   - Optional Google Gemini CLI (gemini)
+#   - Python 3.12 + uv + Node.js 22 LTS + Tool-First Dev MCP toolkit
+#
+# ==============================================================================
+# Build (match your host UID/GID so bind-mounted files keep your ownership)
+# ==============================================================================
+#   docker build -f DevDockerfile \
+#     --build-arg USER_UID=$(id -u) \
+#     --build-arg USER_GID=$(id -g) \
+#     -t {{IMAGE_NAME}} .
+#
+# Optional build args:
+#   --build-arg INSTALL_AGY=true
+#   --build-arg INSTALL_CLAUDE=true
+#   --build-arg INSTALL_CODEX=true
+#   --build-arg INSTALL_GEMINI_CLI=false
+#   --build-arg INSTALL_PLAYWRIGHT={{INSTALL_PLAYWRIGHT}}
+#
+# ==============================================================================
+# Run — Zero-OAuth (reuses existing host logins for agy/gemini, claude, codex)
+# ==============================================================================
+#   docker run --rm -it \
+#     -v "$(pwd):/workspace" \
+#     -v "$HOME/.gemini:/home/dev/.gemini" \
+#     -v "$HOME/.claude:/home/dev/.claude" \
+#     -v "$HOME/.claude.json:/home/dev/.claude.json" \
+#     -v "$HOME/.codex:/home/dev/.codex" \
+#     -p {{APP_PORT}}:{{APP_PORT}} \
+#     --add-host=host.docker.internal:host-gateway \
+#     {{IMAGE_NAME}} bash
+
+FROM python:3.12-slim-bookworm
+
+ARG USER_NAME=dev
+ARG USER_UID=1000
+ARG USER_GID=1000
+ARG INSTALL_AGY=true
+ARG INSTALL_CLAUDE=true
+ARG INSTALL_CODEX=true
+ARG INSTALL_GEMINI_CLI=false
+ARG INSTALL_PLAYWRIGHT={{INSTALL_PLAYWRIGHT}}
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    UV_LINK_MODE=copy \
+    DEV_TOOLS_PYTHON=/opt/dev-tools-venv/bin/python \
+    APP_VENV=/opt/app-venv \
+    UV_PROJECT_ENVIRONMENT=/opt/app-venv \
+    PLAYWRIGHT_BROWSERS_PATH=/opt/ms-playwright \
+    PATH="/opt/app-venv/bin:/home/${USER_NAME}/.local/bin:${PATH}"
+
+# System utilities + native build tools for Python wheels and agent CLIs
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        bash \
+        build-essential \
+        ca-certificates \
+        curl \
+        fd-find \
+        git \
+        gnupg \
+        jq \
+        less \
+        openssh-client \
+        ripgrep \
+        sqlite3 \
+        sudo \
+        tini \
+        vim-tiny \
+    && rm -rf /var/lib/apt/lists/*
+
+# Node.js 22 LTS (required for Codex CLI / Gemini CLI and general JS tooling)
+RUN mkdir -p /etc/apt/keyrings \
+    && curl -fsSL https://deb.nodesource.com/gpgkey/nodesource-repo.gpg.key \
+       | gpg --dearmor -o /etc/apt/keyrings/nodesource.gpg \
+    && echo "deb [signed-by=/etc/apt/keyrings/nodesource.gpg] https://deb.nodesource.com/node_22.x nodistro main" \
+       > /etc/apt/sources.list.d/nodesource.list \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends nodejs \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install Codex CLI (and optional Gemini CLI) globally in /usr/local/bin so
+# bind-mounting ~/.codex or ~/.gemini for zero-OAuth never collides with binaries.
+RUN if [ "$INSTALL_CODEX" = "true" ]; then npm install -g @openai/codex && codex --version; fi \
+    && if [ "$INSTALL_GEMINI_CLI" = "true" ]; then npm install -g @google/gemini-cli && gemini --version; fi \
+    && npm cache clean --force
+
+# Install uv from official static binary image
+COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /usr/local/bin/
+
+# Create non-root developer user matching host UID/GID (required for safe bind-mounts & YOLO flags)
+RUN groupadd --gid "${USER_GID}" "${USER_NAME}" \
+    && useradd --uid "${USER_UID}" --gid "${USER_GID}" -m -s /bin/bash "${USER_NAME}" \
+    && echo "${USER_NAME} ALL=(ALL) NOPASSWD:ALL" > "/etc/sudoers.d/${USER_NAME}" \
+    && chmod 0440 "/etc/sudoers.d/${USER_NAME}"
+
+# Pre-build isolated Tool-First Dev MCP & knowledge-graph virtualenv outside /workspace
+# so bind-mounting the host repo never breaks host/container venv symlinks.
+COPY .agents/plugins/dev-tools/pyproject.toml /tmp/dev-tools/pyproject.toml
+COPY . /tmp/project-meta/
+RUN uv venv /opt/dev-tools-venv \
+    && uv pip install --python /opt/dev-tools-venv/bin/python -r /tmp/dev-tools/pyproject.toml \
+    && uv venv /opt/app-venv \
+    && if [ -f /tmp/project-meta/requirements.txt ]; then \
+         uv pip install --python /opt/app-venv/bin/python -r /tmp/project-meta/requirements.txt; \
+       else \
+         uv pip install --python /opt/app-venv/bin/python pytest; \
+       fi \
+    && if [ "$INSTALL_PLAYWRIGHT" = "true" ]; then \
+         uv pip install --python /opt/app-venv/bin/python playwright \
+         && /opt/app-venv/bin/playwright install-deps chromium \
+         && /opt/app-venv/bin/playwright install chromium; \
+       fi \
+    && rm -rf /tmp/dev-tools /tmp/project-meta /var/lib/apt/lists/* \
+    && mkdir -p /opt/ms-playwright \
+    && chown -R "${USER_UID}:${USER_GID}" /opt/dev-tools-venv /opt/app-venv /opt/ms-playwright
+
+# Pre-create workspace and agent credential mountpoints owned by dev so named volumes inherit dev:dev
+RUN mkdir -p /workspace \
+        "/home/${USER_NAME}/.gemini/antigravity-cli" \
+        "/home/${USER_NAME}/.claude" \
+        "/home/${USER_NAME}/.codex" \
+    && chown -R "${USER_UID}:${USER_GID}" \
+        /workspace \
+        "/home/${USER_NAME}/.gemini" \
+        "/home/${USER_NAME}/.claude" \
+        "/home/${USER_NAME}/.codex"
+
+USER ${USER_NAME}
+WORKDIR /workspace
+
+# Install Antigravity CLI (agy) and Claude Code CLI (claude) into ~/.local/bin
+RUN if [ "$INSTALL_AGY" = "true" ]; then \
+        curl -fsSL https://antigravity.google/cli/install.sh | bash && agy --version; \
+    fi \
+    && if [ "$INSTALL_CLAUDE" = "true" ]; then \
+        curl -fsSL https://claude.ai/install.sh | bash && claude --version; \
+    fi
+
+# Avoid git dubious-ownership errors on bind-mounted repos
+RUN git config --global --add safe.directory /workspace
+
+# Auto-enable skip-permissions for agent CLIs inside this sandboxed dev container
+RUN cat <<'EOF' >> "/home/${USER_NAME}/.bashrc"
+
+# Sandboxed dev-container agent shortcuts (use `command <name>` to run without auto-approve)
+agy() {
+  case "${1:-}" in
+    -h|--help|-v|--version|help|update|mcp|plugin|plugins|models|agent|agents|changelog|install|acp|remote-control|mic-serve)
+      command agy "$@" ;;
+    *)
+      command agy --dangerously-skip-permissions "$@" ;;
+  esac
+}
+claude() {
+  case "${1:-}" in
+    -h|--help|-v|--version|help|update|mcp|config|doctor|install|migrate-installer|setup-token)
+      command claude "$@" ;;
+    *)
+      command claude --dangerously-skip-permissions "$@" ;;
+  esac
+}
+codex() {
+  case "${1:-}" in
+    -h|--help|-V|--version|help|login|logout|mcp|completion|features)
+      command codex "$@" ;;
+    *)
+      command codex --dangerously-bypass-approvals-and-sandbox "$@" ;;
+  esac
+}
+gemini() {
+  case "${1:-}" in
+    -h|--help|-v|--version|help|mcp|extensions)
+      command gemini "$@" ;;
+    *)
+      command gemini --yolo "$@" ;;
+  esac
+}
+EOF
+
+EXPOSE {{APP_PORT}}
+
+ENTRYPOINT ["/usr/bin/tini", "--"]
+CMD ["bash"]

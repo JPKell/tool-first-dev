@@ -1,0 +1,56 @@
+{
+  "project_name": "my-project",
+  "source_dirs": ["app", "tests"],
+  "header_required_dirs": ["app"],
+  "ignore_dirs": [
+    ".git",
+    ".agents",
+    ".claude",
+    ".codex",
+    ".venv",
+    "venv",
+    "__pycache__",
+    ".pytest_cache",
+    ".ruff_cache",
+    "node_modules",
+    "dist",
+    "build"
+  ],
+  "extensions": [".py", ".js"],
+  "roles": [
+    "page",
+    "component",
+    "service",
+    "repository",
+    "router",
+    "schema",
+    "util",
+    "test"
+  ],
+  "patterns": [
+    "thin-router",
+    "service-layer",
+    "repository-pattern",
+    "structured-errors",
+    "contract-first-test",
+    "none"
+  ],
+  "required_header_fields": [
+    "Purpose",
+    "Role",
+    "Patterns",
+    "Depends on",
+    "Exposes",
+    "Tests",
+    "Invariants"
+  ],
+  "embeddings": {
+    "provider": "openweightgym",
+    "suite_application": "my-project-dev-tools"
+  },
+  "summaries": {
+    "provider": "openweightgym",
+    "suite_application": "my-project-dev-tools",
+    "max_source_chars": 8000
+  }
+}

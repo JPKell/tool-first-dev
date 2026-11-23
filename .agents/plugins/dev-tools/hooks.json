@@ -1,0 +1,37 @@
+{
+  "tool-first-guardrails": {
+    "PreToolUse": [
+      {
+        "matcher": "write_file|edit_file|run_command",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "./run_hook.sh pre_tool",
+            "timeout": 10
+          }
+        ]
+      }
+    ]
+  },
+  "knowledge-graph-sync": {
+    "Stop": [
+      {
+        "type": "command",
+        "command": "./run_hook.sh stop",
+        "timeout": 60
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "./run_hook.sh post_tool",
+            "timeout": 15
+          }
+        ]
+      }
+    ]
+  }
+}

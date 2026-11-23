@@ -1,0 +1,11 @@
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.agents/state/
+.agents/plugins/*/.venv/
+.env
+.env.local
+.DS_Store

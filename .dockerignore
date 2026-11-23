@@ -1,0 +1,19 @@
+# Never bake secrets, local virtualenvs, git history, or runtime state into Docker build context
+.git
+.env
+.env.*
+!.env.example
+.venv
+venv
+__pycache__
+*.pyc
+.pytest_cache
+.ruff_cache
+.agents/state
+.agents/plugins/*/.venv
+data
+*.db
+*.sqlite
+*.sqlite3
+*.swp
+.secret_key

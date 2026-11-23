@@ -1,0 +1,10 @@
+# Codex CLI project MCP configuration pointing to the shared Tool-First Dev server.
+# Codex automatically loads AGENTS.md at the repository root and .codex/hooks.json
+# once this repository is marked trusted in ~/.codex/config.toml.
+
+[mcp_servers.project-dev]
+command = ".agents/plugins/dev-tools/run_mcp.sh"
+args = []
+enabled = true
+startup_timeout_sec = 20
+tool_timeout_sec = 180

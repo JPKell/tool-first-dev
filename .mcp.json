@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "project-dev": {
+      "type": "stdio",
+      "command": ".agents/plugins/dev-tools/run_mcp.sh",
+      "args": []
+    }
+  }
+}
