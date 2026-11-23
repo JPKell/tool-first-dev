@@ -1,4 +1,10 @@
-"""Configuration and path discovery for the Tool-First Development toolkit."""
+"""
+Purpose: Load .agents/config.json and discover project roots, source files, and test files.
+Role: service
+Patterns: service-layer
+Tests: tests/test_toolkit.py, tests/test_navigation.py
+Invariants: Paths returned are project-relative; config defaults keep the toolkit usable offline.
+"""
 
 from __future__ import annotations
 
@@ -7,6 +13,30 @@ import os
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
+
+DEFAULT_REQUIRED_HEADER_FIELDS = ("Purpose", "Role", "Patterns", "Tests", "Invariants")
+TEST_DIR_NAMES = frozenset({"tests", "test", "__tests__", "spec"})
+
+
+def is_test_path(path: str) -> bool:
+    """True if a project-relative path looks like a test file or lives in a test directory."""
+    p = Path(path.split("::", 1)[0])
+    name = p.name
+    if any(part in TEST_DIR_NAMES for part in p.parts[:-1]):
+        return True
+    if name.endswith(("_test.py", ".test.js", ".spec.js", ".test.ts", ".spec.ts")):
+        return True
+    # `test_*.py` outside a test dir only counts at the repo root (src/test_runner.py is not a test)
+    return name.startswith("test_") and len(p.parts) == 1
+
+
+def find_project_root(start: str | Path) -> Path:
+    """Walk up from start to the nearest directory containing .agents/config.json (else start)."""
+    origin = Path(start).resolve()
+    for candidate in (origin, *origin.parents):
+        if (candidate / ".agents" / "config.json").is_file():
+            return candidate
+    return origin
 
 
 @dataclass(frozen=True)
@@ -29,6 +59,20 @@ class ToolkitConfig:
     required_header_fields: tuple[str, ...]
     embeddings: dict[str, Any] = field(default_factory=dict)
     summaries: dict[str, Any] = field(default_factory=dict)
+    tests: dict[str, Any] = field(default_factory=dict)
+
+    @property
+    def templates_dir(self) -> Path:
+        return self.agents_dir / "templates"
+
+    @property
+    def test_timeout_s(self) -> int:
+        return int(self.tests.get("timeout_s", 300))
+
+    def remote_enabled(self, kind: str) -> bool:
+        """True if 'embeddings' or 'summaries' is configured to use OpenWeightGym."""
+        section = self.embeddings if kind == "embeddings" else self.summaries
+        return section.get("provider") == "openweightgym"
 
     def discover_source_files(self, scope: str | None = None) -> list[Path]:
         """Return sorted project-relative source file paths under configured source_dirs."""
@@ -123,11 +167,9 @@ def load_config(explicit_root: str | Path | None = None) -> ToolkitConfig:
         ),
         patterns=tuple(raw.get("patterns", ["none"])),
         required_header_fields=tuple(
-            raw.get(
-                "required_header_fields",
-                ["Purpose", "Role", "Patterns", "Depends on", "Exposes", "Tests", "Invariants"],
-            )
+            raw.get("required_header_fields", list(DEFAULT_REQUIRED_HEADER_FIELDS))
         ),
-        embeddings=dict(raw.get("embeddings", {"provider": "local-tfidf"})),
-        summaries=dict(raw.get("summaries", {"provider": "heuristic"})),
+        embeddings=dict(raw.get("embeddings", {"provider": "local-bm25"})),
+        summaries=dict(raw.get("summaries", {"provider": "none"})),
+        tests=dict(raw.get("tests", {})),
     )

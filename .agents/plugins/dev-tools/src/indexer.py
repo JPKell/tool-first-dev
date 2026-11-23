@@ -1,4 +1,10 @@
-"""Incremental and full knowledge-graph indexing pipeline with OpenWeightGym summaries & embeddings."""
+"""
+Purpose: Incremental/full knowledge-graph indexing with optional OpenWeightGym summaries & embeddings.
+Role: service
+Patterns: service-layer
+Tests: tests/test_toolkit.py, tests/test_navigation.py
+Invariants: Local AST/header indexing never depends on the network; remote sync backs off on outages.
+"""
 
 from __future__ import annotations
 
@@ -6,8 +12,10 @@ import argparse
 import hashlib
 import json
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
+
+import httpx
 
 from .config import ToolkitConfig, load_config
 from .graph_store import GraphStore
@@ -15,6 +23,25 @@ from .headers import parse_and_validate_header
 from .owg_client import OWGClient, OWGError, load_owg_settings
 from .parser import parse_file
 from .similarity import build_embedding_document
+
+REMOTE_BACKOFF_MINUTES = 10
+LIST_CAP = 20
+
+
+def _is_transport_error(exc: BaseException) -> bool:
+    return isinstance(exc, httpx.TransportError)
+
+
+def _backoff_active(store: GraphStore) -> str | None:
+    until = store.get_meta().get("remote_backoff_until")
+    if not until:
+        return None
+    try:
+        if datetime.fromisoformat(until) > datetime.now(UTC):
+            return until
+    except ValueError:
+        return None
+    return None
 
 
 def sha256_text(text: str) -> str:
@@ -40,6 +67,8 @@ def reindex_project(
     owg_client: OWGClient | None = None,
     max_remote_summaries: int | None = None,
     summary_workers: int = 4,
+    respect_backoff: bool = False,
+    remote_timeout: float = 45.0,
 ) -> dict[str, Any]:
     """Incrementally (or fully) index source files into the SQLite knowledge graph.
 
@@ -47,6 +76,10 @@ def reindex_project(
     OpenWeightGym (/v1/chat/completions and /v1/embeddings). When sync_remote=False
     (e.g., mid-turn PostToolUse), AST symbols, edges, and headers update instantly while
     leaving remote summary/embedding sync for the post-turn Stop hook or explicit reindex.
+
+    Remote sync is skipped (reported in `remote_skipped`) when the providers are not
+    `openweightgym`, OpenWeightGym is not configured, or — with respect_backoff=True — a
+    transport failure happened within the last REMOTE_BACKOFF_MINUTES.
     """
     cfg = config or load_config()
     store = GraphStore(cfg.db_path)
@@ -72,8 +105,8 @@ def reindex_project(
             skipped_files += 1
             continue
 
-        header = parse_and_validate_header(rel, source, cfg)
         parsed = parse_file(rel, source)
+        header = parse_and_validate_header(rel, source, cfg, parsed=parsed)
         prev = store.get_file(rel_str)
         prev_summary = prev["summary"] if prev and not full else ""
         prev_summary_hash = prev["summary_hash"] if prev and not full else ""
@@ -101,19 +134,37 @@ def reindex_project(
     remote_errors: list[str] = []
     summary_model_used = ""
     embedding_model_used = ""
+    remote_skipped = ""
+    transport_failed = False
 
+    want_summaries = cfg.remote_enabled("summaries")
+    want_embeddings = cfg.remote_enabled("embeddings")
+    client: Any = owg_client
     if sync_remote and current_paths:
-        client = owg_client or OWGClient(
-            load_owg_settings(
+        if not (want_summaries or want_embeddings):
+            remote_skipped = "remote providers disabled in .agents/config.json"
+        elif respect_backoff and (until := _backoff_active(store)):
+            remote_skipped = f"remote backoff until {until} after a connection failure"
+        elif client is None:
+            settings = load_owg_settings(
                 cfg.project_root,
                 suite_application=cfg.embeddings.get("suite_application", "tool-first-dev"),
             )
-        )
+            if settings.is_configured:
+                client = OWGClient(settings, timeout=remote_timeout)
+            else:
+                remote_skipped = "OpenWeightGym not configured (.env); using local-only index"
+
+    if sync_remote and current_paths and not remote_skipped:
         all_files = store.get_all_files()
         max_chars = int(cfg.summaries.get("max_source_chars", 8000))
 
         # 1. Generate OpenWeightGym summaries concurrently for files whose content hash changed
-        need_summary = [f for f in all_files if full or f["summary_hash"] != f["content_hash"]]
+        need_summary = (
+            [f for f in all_files if full or f["summary_hash"] != f["content_hash"]]
+            if want_summaries
+            else []
+        )
         if max_remote_summaries is not None and len(need_summary) > max_remote_summaries:
             deferred_summaries = len(need_summary) - max_remote_summaries
             summary_batch = need_summary[:max_remote_summaries]
@@ -124,12 +175,10 @@ def reindex_project(
         if summary_batch and hasattr(client, "resolve_summary_model"):
             try:
                 client.resolve_summary_model()
-            except OWGError as exc:
-                remote_errors.append(f"summary(init): {exc}")
-                can_summarize = False
             except Exception as exc:
                 remote_errors.append(f"summary(init): {exc}")
                 can_summarize = False
+                transport_failed = transport_failed or _is_transport_error(exc)
 
         if summary_batch and can_summarize:
             workers = max(1, min(summary_workers, len(summary_batch)))
@@ -160,6 +209,9 @@ def reindex_project(
                         summarized_files.append(f["path"])
                     except Exception as exc:
                         remote_errors.append(f"summary({f['path']}): {exc}")
+                        if _is_transport_error(exc):
+                            transport_failed = True
+                            break
                         if isinstance(exc, OWGError) and exc.status_code in (None, 401, 403):
                             break
             else:
@@ -179,6 +231,7 @@ def reindex_project(
                             summarized_files.append(f["path"])
                         except Exception as exc:
                             remote_errors.append(f"summary({f['path']}): {exc}")
+                            transport_failed = transport_failed or _is_transport_error(exc)
                 summarized_files.sort()
 
         # 2. Generate OpenWeightGym embeddings in one batch for stale/missing vectors
@@ -188,6 +241,11 @@ def reindex_project(
         need_embed = [
             f
             for f in all_files
+            if want_embeddings and not transport_failed
+        ]
+        need_embed = [
+            f
+            for f in need_embed
             if full
             or f["path"] not in existing_vectors
             or existing_vectors[f["path"]].get("content_hash") != f["content_hash"]
@@ -209,6 +267,13 @@ def reindex_project(
                     embedded_files.append(f["path"])
             except Exception as exc:
                 remote_errors.append(f"embeddings: {exc}")
+                transport_failed = transport_failed or _is_transport_error(exc)
+
+        if transport_failed:
+            until = datetime.now(UTC) + timedelta(minutes=REMOTE_BACKOFF_MINUTES)
+            store.set_meta("remote_backoff_until", until.isoformat())
+        elif not remote_errors:
+            store.set_meta("remote_backoff_until", "")
 
     now = datetime.now(UTC).isoformat()
     store.set_meta("last_indexed_at", now)
@@ -233,6 +298,7 @@ def reindex_project(
         "embedding_model": embedding_model_used,
         "invalid_headers": invalid_headers,
         "remote_errors": remote_errors,
+        "remote_skipped": remote_skipped,
         "graph_stats": store.stats(),
         "indexed_at": now,
     }
@@ -272,19 +338,33 @@ def get_index_status(config: ToolkitConfig | None = None) -> dict[str, Any]:
     ]
 
     owg_settings = load_owg_settings(cfg.project_root)
+    summaries_on = cfg.remote_enabled("summaries") and owg_settings.is_configured
+    embeddings_on = cfg.remote_enabled("embeddings") and owg_settings.is_configured
+    if not summaries_on:
+        stale_summaries = []
+    if not embeddings_on:
+        stale_embeddings = []
     fresh = not (unindexed or deleted or stale or stale_summaries or stale_embeddings)
+
+    def _cap(items: list[Any]) -> dict[str, Any] | list[Any]:
+        if len(items) <= LIST_CAP:
+            return items
+        return {"count": len(items), "first": items[:LIST_CAP]}
+
+    meta = {k: v for k, v in store.get_meta().items() if v}
     return {
         "fresh": fresh,
+        "remote_enabled": summaries_on or embeddings_on,
         "owg_configured": owg_settings.is_configured,
         "owg_base_url": owg_settings.base_url if owg_settings.is_configured else "",
         "graph_stats": store.stats(),
-        "meta": store.get_meta(),
-        "unindexed_files": unindexed,
-        "stale_files": stale,
-        "deleted_files": deleted,
-        "invalid_headers": invalid_headers,
-        "stale_summaries": stale_summaries,
-        "stale_embeddings": stale_embeddings,
+        "meta": meta,
+        "unindexed_files": _cap(unindexed),
+        "stale_files": _cap(stale),
+        "deleted_files": _cap(deleted),
+        "invalid_headers": _cap(invalid_headers),
+        "stale_summaries": _cap(stale_summaries),
+        "stale_embeddings": _cap(stale_embeddings),
     }
 
 

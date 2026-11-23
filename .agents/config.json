@@ -1,7 +1,12 @@
 {
   "project_name": "my-project",
-  "source_dirs": ["app", "tests"],
-  "header_required_dirs": ["app"],
+  "source_dirs": [
+    "app",
+    "tests"
+  ],
+  "header_required_dirs": [
+    "app"
+  ],
   "ignore_dirs": [
     ".git",
     ".agents",
@@ -16,7 +21,10 @@
     "dist",
     "build"
   ],
-  "extensions": [".py", ".js"],
+  "extensions": [
+    ".py",
+    ".js"
+  ],
   "roles": [
     "page",
     "component",
@@ -39,8 +47,6 @@
     "Purpose",
     "Role",
     "Patterns",
-    "Depends on",
-    "Exposes",
     "Tests",
     "Invariants"
   ],
@@ -52,5 +58,9 @@
     "provider": "openweightgym",
     "suite_application": "my-project-dev-tools",
     "max_source_chars": 8000
+  },
+  "tests": {
+    "timeout_s": 300,
+    "js_command": []
   }
 }

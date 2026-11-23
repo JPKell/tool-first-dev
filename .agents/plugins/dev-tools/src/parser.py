@@ -1,4 +1,10 @@
-"""Tree-sitter based symbol, import, and call-graph extractor for Python and JS."""
+"""
+Purpose: Tree-sitter based symbol, import, and call-graph extractor for Python and JavaScript.
+Role: util
+Patterns: none
+Tests: tests/test_toolkit.py, tests/test_navigation.py
+Invariants: Pure parsing (no I/O); nested functions are indexed as `outer.inner` and own their calls.
+"""
 
 from __future__ import annotations
 
@@ -220,6 +226,7 @@ class ExtractedSymbol:
     end_line: int
     signature: str
     docstring: str = ""
+    top_level: bool = True  # False for closures and defs inside `if __name__ == "__main__"`
 
 
 @dataclass
@@ -236,6 +243,7 @@ class ParsedFile:
     line_count: int
     symbols: list[ExtractedSymbol] = field(default_factory=list)
     edges: list[ExtractedEdge] = field(default_factory=list)
+    import_modules: list[str] = field(default_factory=list)  # module names only, in source order
 
 
 def _node_text(node: Node, src_bytes: bytes) -> str:
@@ -297,6 +305,26 @@ def _is_noisy_js_call(target: str) -> bool:
     return False
 
 
+PY_DEF_TYPES = frozenset({"function_definition", "class_definition", "decorated_definition"})
+JS_DEF_TYPES = frozenset({"function_declaration", "class_declaration"})
+
+
+def _nested_defs(node: Node, def_types: frozenset[str]) -> list[Node]:
+    """Return definitions nested anywhere under node without descending into other definitions."""
+    found: list[Node] = []
+    for child in node.named_children:
+        if child.type in def_types:
+            found.append(child)
+        else:
+            found.extend(_nested_defs(child, def_types))
+    return found
+
+
+def _is_main_guard(node: Node, src_bytes: bytes) -> bool:
+    cond = node.child_by_field_name("condition")
+    return node.type == "if_statement" and cond is not None and "__name__" in _node_text(cond, src_bytes)
+
+
 def _collect_py_calls(node: Node, src_bytes: bytes, owner: str, out: list[ExtractedEdge]) -> None:
     if node.type == "call":
         func = node.child_by_field_name("function")
@@ -327,13 +355,20 @@ def _parse_python(src_bytes: bytes) -> ParsedFile:
         line_count=len(src_bytes.splitlines()),
     )
 
-    def walk(node: Node, class_prefix: str = "") -> None:
+    def walk(
+        node: Node,
+        class_prefix: str = "",
+        in_function: bool = False,
+        top_level: bool = True,
+        start_override: int | None = None,
+    ) -> None:
         ntype = node.type
 
         if ntype == "import_statement":
             for child in node.named_children:
                 if child.type in {"dotted_name", "aliased_import"}:
                     target = _node_text(child, src_bytes).split(" as ")[0].strip()
+                    result.import_modules.append(target)
                     result.edges.append(
                         ExtractedEdge(
                             source_symbol="<module>",
@@ -347,6 +382,8 @@ def _parse_python(src_bytes: bytes) -> ParsedFile:
         if ntype == "import_from_statement":
             mod_node = node.child_by_field_name("module_name")
             mod_name = _node_text(mod_node, src_bytes).strip() if mod_node else ""
+            if mod_name:
+                result.import_modules.append(mod_name)
             imported_names: list[str] = []
             for child in node.named_children:
                 if child is mod_node:
@@ -387,15 +424,16 @@ def _parse_python(src_bytes: bytes) -> ParsedFile:
                         name=name,
                         qualified_name=qname,
                         kind="class",
-                        start_line=node.start_point.row + 1,
+                        start_line=start_override or node.start_point.row + 1,
                         end_line=node.end_point.row + 1,
                         signature=first_line,
                         docstring=_extract_py_docstring(body, src_bytes),
+                        top_level=top_level and not class_prefix,
                     )
                 )
                 if body:
                     for child in body.named_children:
-                        walk(child, qname)
+                        walk(child, qname, in_function=False, top_level=False)
             return
 
         if ntype == "function_definition":
@@ -404,35 +442,49 @@ def _parse_python(src_bytes: bytes) -> ParsedFile:
             if name_node:
                 name = _node_text(name_node, src_bytes)
                 qname = f"{class_prefix}.{name}" if class_prefix else name
-                kind = "method" if class_prefix else "function"
+                kind = "method" if class_prefix and not in_function else "function"
                 header_text = _extract_py_signature(node, body, src_bytes)
                 result.symbols.append(
                     ExtractedSymbol(
                         name=name,
                         qualified_name=qname,
                         kind=kind,
-                        start_line=node.start_point.row + 1,
+                        start_line=start_override or node.start_point.row + 1,
                         end_line=node.end_point.row + 1,
                         signature=header_text,
                         docstring=_extract_py_docstring(body, src_bytes),
+                        top_level=top_level and not class_prefix,
                     )
                 )
                 if body:
                     _collect_py_calls(body, src_bytes, qname, result.edges)
+                    # Closures/local classes become `outer.inner` symbols that own their calls
+                    for nested in _nested_defs(body, PY_DEF_TYPES):
+                        walk(nested, qname, in_function=True, top_level=False)
             return
 
         if ntype == "decorated_definition":
             for child in node.named_children:
                 if child.type in {"function_definition", "class_definition"}:
-                    walk(child, class_prefix)
+                    walk(
+                        child,
+                        class_prefix,
+                        in_function=in_function,
+                        top_level=top_level,
+                        start_override=node.start_point.row + 1,
+                    )
             return
 
         if not class_prefix:
             _collect_py_calls(node, src_bytes, "<module>", result.edges)
+            # Defs inside module-level blocks (if/try/with) are still real symbols
+            nested_top = top_level and not _is_main_guard(node, src_bytes)
+            for nested in _nested_defs(node, PY_DEF_TYPES):
+                walk(nested, "", top_level=nested_top)
             return
 
         for child in node.named_children:
-            walk(child, class_prefix)
+            walk(child, class_prefix, in_function=in_function, top_level=False)
 
     for child in root.named_children:
         walk(child)
@@ -517,6 +569,7 @@ def _parse_javascript(src_bytes: bytes) -> ParsedFile:
                         start_line=decl.start_point.row + 1,
                         end_line=decl.end_point.row + 1,
                         signature=" ".join(raw_sig.split())[:240],
+                        top_level=not class_prefix,
                     )
                 )
                 if body is not None:
@@ -533,6 +586,7 @@ def _parse_javascript(src_bytes: bytes) -> ParsedFile:
             source_node = node.child_by_field_name("source")
             if source_node:
                 mod_target = _node_text(source_node, src_bytes).strip("'\"")
+                result.import_modules.append(mod_target)
                 line_no = node.start_point.row + 1
                 result.edges.append(
                     ExtractedEdge(
@@ -578,6 +632,7 @@ def _parse_javascript(src_bytes: bytes) -> ParsedFile:
                         start_line=node.start_point.row + 1,
                         end_line=node.end_point.row + 1,
                         signature=first_line,
+                        top_level=not class_prefix,
                     )
                 )
                 if body:
@@ -601,10 +656,16 @@ def _parse_javascript(src_bytes: bytes) -> ParsedFile:
                         start_line=node.start_point.row + 1,
                         end_line=node.end_point.row + 1,
                         signature=" ".join(first_line.split())[:240],
+                        top_level=not class_prefix,
                     )
                 )
                 if body:
                     _collect_js_calls(body, src_bytes, qname, result.edges)
+                    for nested in _nested_defs(body, JS_DEF_TYPES):
+                        first_new = len(result.symbols)
+                        walk(nested, qname)
+                        for sym in result.symbols[first_new:]:
+                            sym.top_level = False
             return
 
         if not class_prefix:

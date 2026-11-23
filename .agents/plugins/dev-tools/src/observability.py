@@ -1,4 +1,10 @@
-"""Observability logger and metrics summarizer for MCP calls and fallback reads/greps."""
+"""
+Purpose: Append-only JSONL telemetry for MCP calls and fallbacks, plus token-savings metrics.
+Role: repository
+Patterns: repository-pattern
+Tests: tests/test_toolkit.py, tests/test_navigation.py
+Invariants: Logs are append-only; token figures are estimates at BYTES_PER_TOKEN bytes per token.
+"""
 
 from __future__ import annotations
 
@@ -7,6 +13,13 @@ from collections import Counter
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
+
+BYTES_PER_TOKEN = 4
+
+
+def est_tokens(n_bytes: float) -> int:
+    """Rough token estimate for a UTF-8 payload size."""
+    return int(round(n_bytes / BYTES_PER_TOKEN))
 
 
 def _now() -> datetime:
@@ -28,19 +41,21 @@ def log_mcp_call(
     duration_ms: float,
     ok: bool = True,
     error: str | None = None,
+    baseline_bytes: int | None = None,
 ) -> None:
-    append_event(
-        log_path,
-        {
-            "event": "mcp_call",
-            "tool": tool,
-            "args": args,
-            "result_bytes": result_bytes,
-            "duration_ms": round(duration_ms, 2),
-            "ok": ok,
-            "error": error,
-        },
-    )
+    """Record one MCP call. baseline_bytes = bytes the agent would otherwise have read."""
+    event: dict[str, Any] = {
+        "event": "mcp_call",
+        "tool": tool,
+        "args": args,
+        "result_bytes": result_bytes,
+        "duration_ms": round(duration_ms, 2),
+        "ok": ok,
+        "error": error,
+    }
+    if baseline_bytes is not None:
+        event["baseline_bytes"] = int(baseline_bytes)
+    append_event(log_path, event)
 
 
 def _last_mcp_call(log_path: Path) -> dict[str, Any] | None:
@@ -205,6 +220,8 @@ def summarize_metrics(
         out: dict[str, Any] = {
             "total_mcp_calls": 0,
             "total_fallbacks": 0,
+            "est_tokens_returned": 0,
+            "est_tokens_saved": 0,
             "by_tool": {},
             "fallbacks_after_mcp": {},
             "recent": [],
@@ -232,12 +249,17 @@ def summarize_metrics(
         if ev == "mcp_call":
             total_mcp += 1
             t = rec.get("tool", "unknown")
-            bucket = by_tool.setdefault(t, {"calls": 0, "errors": 0, "total_bytes": 0, "total_ms": 0.0})
+            bucket = by_tool.setdefault(
+                t, {"calls": 0, "errors": 0, "total_bytes": 0, "total_ms": 0.0, "saved_bytes": 0}
+            )
             bucket["calls"] += 1
             if not rec.get("ok", True):
                 bucket["errors"] += 1
-            bucket["total_bytes"] += int(rec.get("result_bytes", 0))
+            result_bytes = int(rec.get("result_bytes", 0))
+            bucket["total_bytes"] += result_bytes
             bucket["total_ms"] += float(rec.get("duration_ms", 0.0))
+            if rec.get("baseline_bytes") is not None:
+                bucket["saved_bytes"] += max(0, int(rec["baseline_bytes"]) - result_bytes)
         elif ev == "agent_fallback":
             total_fallbacks += 1
             if rec.get("followed_mcp_tool"):
@@ -249,16 +271,25 @@ def summarize_metrics(
             "errors": b["errors"],
             "avg_bytes": round(b["total_bytes"] / b["calls"], 1) if b["calls"] else 0,
             "avg_ms": round(b["total_ms"] / b["calls"], 1) if b["calls"] else 0,
+            "est_tokens_returned": est_tokens(b["total_bytes"]),
+            "est_tokens_saved": est_tokens(b["saved_bytes"]),
         }
         for tool, b in sorted(by_tool.items())
     }
 
+    recent = [
+        {k: r.get(k) for k in ("ts", "event", "tool", "result_bytes", "ok") if r.get(k) is not None}
+        for r in records[-recent_limit:]
+    ]
     result: dict[str, Any] = {
         "total_mcp_calls": total_mcp,
         "total_fallbacks": total_fallbacks,
+        "est_tokens_returned": est_tokens(sum(b["total_bytes"] for b in by_tool.values())),
+        "est_tokens_saved": est_tokens(sum(b["saved_bytes"] for b in by_tool.values())),
+        "est_tokens_note": "saved = (bytes of files the agent would have read) - (tool payload), /4",
         "by_tool": compact_by_tool,
         "fallbacks_after_mcp": dict(fallbacks_after),
-        "recent": records[-recent_limit:],
+        "recent": recent,
     }
     if non_mcp is not None:
         total_all = total_mcp + non_mcp["total_non_mcp_calls"]

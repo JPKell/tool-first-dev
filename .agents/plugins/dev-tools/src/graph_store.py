@@ -1,4 +1,10 @@
-"""SQLite-backed knowledge graph store for files, symbols, edges, summaries, and embeddings."""
+"""
+Purpose: SQLite-backed knowledge graph of files, symbols, call/import edges, summaries, and vectors.
+Role: repository
+Patterns: repository-pattern
+Tests: tests/test_toolkit.py, tests/test_navigation.py
+Invariants: Parameterized SQL only; callers/importers are resolved through imports, not bare names.
+"""
 
 from __future__ import annotations
 
@@ -8,8 +14,45 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from .config import is_test_path
 from .headers import ModuleHeader
 from .parser import ParsedFile
+
+JS_EXTS = (".js", ".mjs", ".cjs", ".jsx", ".ts", ".tsx")
+
+
+def normalize_module(spec: str) -> str:
+    """Normalize a Python dotted / relative or JS path import spec to a dotted module path."""
+    s = spec.strip().strip("'\"")
+    while s.startswith(("./", "../")):
+        s = s[2:] if s.startswith("./") else s[3:]
+    for ext in JS_EXTS + (".py",):
+        if s.endswith(ext):
+            s = s[: -len(ext)]
+            break
+    s = s.lstrip(".").replace("/", ".")
+    if s.endswith(".index") or s.endswith(".__init__"):
+        s = s.rsplit(".", 1)[0]
+    return s
+
+
+def file_module(rel_path: str) -> str:
+    """Dotted module path for a project-relative file (app/math_util.py -> app.math_util)."""
+    return normalize_module(rel_path)
+
+
+def module_matches(import_spec: str, rel_path: str) -> bool:
+    """True if an import spec plausibly refers to the module stored at rel_path."""
+    imp = normalize_module(import_spec)
+    if not imp:
+        return False
+    mod = file_module(rel_path)
+    return mod == imp or mod.endswith(f".{imp}")
+
+
+def _compact(entry: dict[str, Any]) -> dict[str, Any]:
+    """Drop empty values so payloads only carry information."""
+    return {k: v for k, v in entry.items() if v not in ("", [], {}, None)}
 
 SCHEMA_SQL = """
 PRAGMA journal_mode=WAL;
@@ -343,8 +386,112 @@ class GraphStore:
                     }
             return out
 
-    def lookup_symbol(self, symbol: str, include_impact: bool = True) -> dict[str, Any]:
-        """Find symbol definitions, callers, callees, importers, and covering tests."""
+    # ------------------------------------------------------------------ resolution
+
+    def _imports_by_file(self, conn: sqlite3.Connection) -> dict[str, list[str]]:
+        rows = conn.execute(
+            "SELECT source_file, target FROM edges WHERE edge_type = 'imports'"
+        ).fetchall()
+        out: dict[str, list[str]] = {}
+        for r in rows:
+            out.setdefault(r["source_file"], []).append(r["target"])
+        return out
+
+    @staticmethod
+    def _imports_name_from(imports: list[str], name: str, def_file: str) -> bool:
+        """True if an import list brings `name` in from the module defined by def_file."""
+        suffix = f".{name}"
+        return any(
+            imp.endswith(suffix) and module_matches(imp[: -len(suffix)], def_file) for imp in imports
+        )
+
+    @staticmethod
+    def _imported_module_aliases(imports: list[str], def_file: str) -> set[str]:
+        """Names under which def_file's module is reachable in a file (e.g. `math_util`)."""
+        aliases: set[str] = set()
+        for imp in imports:
+            if module_matches(imp, def_file):
+                aliases.add(imp)
+                aliases.add(normalize_module(imp).rsplit(".", 1)[-1])
+        return aliases
+
+    def _caller_match(
+        self,
+        target: str,
+        caller_file: str,
+        definition: dict[str, Any],
+        imports: list[str],
+    ) -> str | None:
+        """Classify whether a call edge refers to this definition: same_file, import, or None."""
+        name = definition["name"]
+        def_file = definition["file_path"]
+        qname = definition["qualified_name"]
+        owner = qname.rsplit(".", 1)[0] if "." in qname else ""
+        prefix = target[: -len(name) - 1] if target.endswith(f".{name}") else None
+        if target != name and prefix is None:
+            return None
+
+        if caller_file == def_file:
+            if target in {name, qname} or prefix in {"self", "cls", owner}:
+                return "same_file"
+            return None
+
+        if target == name:
+            return "import" if self._imports_name_from(imports, name, def_file) else None
+        assert prefix is not None
+        if prefix in self._imported_module_aliases(imports, def_file):
+            return "import"
+        if definition["kind"] == "method" and owner:
+            top_owner = owner.split(".", 1)[0]
+            if prefix == owner or self._imports_name_from(imports, top_owner, def_file):
+                # obj.method() where the caller imports the owning class (receiver type unchecked)
+                return "import"
+        return None
+
+    def _resolve_callee(
+        self,
+        target: str,
+        source_file: str,
+        imports: list[str],
+        by_name: dict[str, list[dict[str, Any]]],
+    ) -> str | None:
+        """Return the project file defining a call target, or None for external calls."""
+        leaf = target.rsplit(".", 1)[-1]
+        candidates = by_name.get(leaf, [])
+        if not candidates:
+            return None
+        files = sorted({c["file_path"] for c in candidates})
+        if source_file in files and (target == leaf or target.split(".", 1)[0] in {"self", "cls"}):
+            return source_file
+        for f in files:
+            if self._imports_name_from(imports, leaf, f) or (
+                "." in target and target.rsplit(".", 1)[0] in self._imported_module_aliases(imports, f)
+            ):
+                return f
+        if target.split(".", 1)[0] in {"self", "cls"} and source_file in files:
+            return source_file
+        if len(files) == 1 and target == leaf:
+            return files[0]
+        return None
+
+    # ------------------------------------------------------------------ queries
+
+    def lookup_symbol(
+        self,
+        symbol: str,
+        include_impact: bool = True,
+        path: str | None = None,
+        limit: int = 25,
+    ) -> dict[str, Any]:
+        """Find definitions plus import-resolved callers, callees, importers, and covering tests.
+
+        Args:
+            symbol: Bare name (`add_numbers`) or qualified name (`BillingService.total`).
+            include_impact: When False, only definitions are returned.
+            path: Optional project-relative file to disambiguate same-named symbols.
+            limit: Max entries per list; overflow counts are reported under `truncated`.
+        """
+        short_name = symbol.split(".")[-1]
         with self._connect() as conn:
             defs = conn.execute(
                 """
@@ -356,84 +503,133 @@ class GraphStore:
                 (symbol, symbol, f"%.{symbol}"),
             ).fetchall()
             definitions = [dict(r) for r in defs]
+            if "." in symbol:
+                exact = [d for d in definitions if d["qualified_name"].endswith(symbol)]
+                definitions = exact or definitions
+            if path:
+                norm = path.strip().lstrip("./")
+                definitions = [d for d in definitions if d["file_path"] == norm]
 
-            result: dict[str, Any] = {
-                "symbol": symbol,
-                "definitions": definitions,
-            }
-            if not include_impact:
+            result: dict[str, Any] = {"symbol": symbol, "definitions": definitions}
+            if not include_impact or not definitions:
                 return result
 
-            short_name = symbol.split(".")[-1]
-            callers_rows = conn.execute(
+            imports_by_file = self._imports_by_file(conn)
+            multi = len({d["file_path"] for d in definitions}) > 1
+
+            # Callers: name-filtered in SQL, then resolved through the caller's imports
+            call_rows = conn.execute(
                 """
                 SELECT DISTINCT source_file, source_symbol, target, line_number
                 FROM edges
-                WHERE edge_type = 'calls'
-                  AND (target = ? OR target = ? OR target LIKE ? OR target LIKE ?)
-                ORDER BY source_file, line_number
-                """,
-                (symbol, short_name, f"%.{short_name}", f"%.{symbol}"),
-            ).fetchall()
-
-            def_files = {d["file_path"] for d in definitions}
-            callees: list[dict[str, Any]] = []
-            if definitions:
-                clauses: list[str] = []
-                params: list[str] = []
-                for d in definitions:
-                    if d["kind"] == "class":
-                        clauses.append(
-                            "(source_file = ? AND (source_symbol = ? OR source_symbol LIKE ?))"
-                        )
-                        params.extend([d["file_path"], d["qualified_name"], f"{d['qualified_name']}.%"])
-                    else:
-                        clauses.append("(source_file = ? AND source_symbol = ?)")
-                        params.extend([d["file_path"], d["qualified_name"]])
-                where_sql = " OR ".join(clauses)
-                callee_rows = conn.execute(
-                    f"""
-                    SELECT source_file, source_symbol, target, MIN(line_number) AS line_number
-                    FROM edges
-                    WHERE edge_type = 'calls' AND ({where_sql})
-                    GROUP BY source_file, source_symbol, target
-                    ORDER BY source_file, line_number
-                    """,
-                    tuple(params),
-                ).fetchall()
-                callees = [dict(r) for r in callee_rows]
-
-            importers_rows = conn.execute(
-                """
-                SELECT DISTINCT source_file, target, line_number
-                FROM edges
-                WHERE edge_type = 'imports'
-                  AND (target = ? OR target LIKE ?)
+                WHERE edge_type = 'calls' AND (target = ? OR target LIKE ?)
                 ORDER BY source_file, line_number
                 """,
                 (short_name, f"%.{short_name}"),
             ).fetchall()
+            callers: list[dict[str, Any]] = []
+            unresolved = 0
+            for r in call_rows:
+                imports = imports_by_file.get(r["source_file"], [])
+                hit = None
+                for d in definitions:
+                    match = self._caller_match(r["target"], r["source_file"], d, imports)
+                    if match:
+                        hit = (d, match)
+                        break
+                if hit is None:
+                    unresolved += 1
+                    continue
+                entry = dict(r)
+                if multi:
+                    entry["resolves_to"] = hit[0]["file_path"]
+                callers.append(entry)
 
-            covering_tests: set[str] = set()
-            for fpath in def_files:
-                t_rows = conn.execute(
-                    "SELECT target FROM edges WHERE source_file = ? AND edge_type = 'tested_by'",
-                    (fpath,),
+            # Callees: calls made inside each definition (and its methods/closures), deduped
+            clauses: list[str] = []
+            params: list[str] = []
+            for d in definitions:
+                clauses.append("(source_file = ? AND (source_symbol = ? OR source_symbol LIKE ?))")
+                params.extend([d["file_path"], d["qualified_name"], f"{d['qualified_name']}.%"])
+            callee_rows = conn.execute(
+                f"""
+                SELECT source_file, source_symbol, target, MIN(line_number) AS line_number
+                FROM edges
+                WHERE edge_type = 'calls' AND ({" OR ".join(clauses)})
+                GROUP BY source_file, target
+                ORDER BY line_number
+                """,
+                tuple(params),
+            ).fetchall()
+            by_name: dict[str, list[dict[str, Any]]] = {}
+            for r in conn.execute("SELECT name, file_path FROM symbols").fetchall():
+                by_name.setdefault(r["name"], []).append(dict(r))
+            callees: list[dict[str, Any]] = []
+            external: list[str] = []
+            for r in callee_rows:
+                defined_in = self._resolve_callee(
+                    r["target"], r["source_file"], imports_by_file.get(r["source_file"], []), by_name
+                )
+                if defined_in:
+                    callees.append(
+                        {
+                            "target": r["target"],
+                            "source_symbol": r["source_symbol"],
+                            "line_number": r["line_number"],
+                            "defined_in": defined_in,
+                        }
+                    )
+                elif r["target"] not in external:
+                    external.append(r["target"])
+
+            # Importers: files whose imports resolve to a definition's module
+            importers: list[dict[str, Any]] = []
+            for d in definitions:
+                imp_rows = conn.execute(
+                    """
+                    SELECT DISTINCT source_file, target, line_number FROM edges
+                    WHERE edge_type = 'imports' AND source_file != ?
+                    ORDER BY source_file, line_number
+                    """,
+                    (d["file_path"],),
                 ).fetchall()
-                covering_tests.update(r["target"] for r in t_rows)
+                for r in imp_rows:
+                    t = r["target"]
+                    if (t.endswith(f".{d['name']}") and module_matches(t[: -len(d["name"]) - 1], d["file_path"])):
+                        importers.append(dict(r))
 
-            for r in callers_rows:
-                if r["source_file"].startswith("tests/"):
-                    covering_tests.add(f"{r['source_file']}::{r['source_symbol']}")
-            for r in importers_rows:
-                if r["source_file"].startswith("tests/"):
-                    covering_tests.add(r["source_file"])
+            covering: set[str] = set()
+            for d in definitions:
+                for r in conn.execute(
+                    "SELECT target FROM edges WHERE source_file = ? AND edge_type = 'tested_by'",
+                    (d["file_path"],),
+                ).fetchall():
+                    covering.add(r["target"])
+            for c in callers:
+                if is_test_path(c["source_file"]):
+                    covering.add(f"{c['source_file']}::{c['source_symbol']}")
+            for i in importers:
+                if is_test_path(i["source_file"]):
+                    covering.add(i["source_file"])
 
-            result["callers"] = [dict(r) for r in callers_rows]
-            result["callees"] = callees
-            result["importers"] = [dict(r) for r in importers_rows]
-            result["covering_tests"] = sorted(covering_tests)
-            return result
+        truncated: dict[str, int] = {}
+
+        def _cap(name: str, items: list[Any]) -> list[Any]:
+            if len(items) > limit:
+                truncated[name] = len(items) - limit
+                return items[:limit]
+            return items
+
+        result["callers"] = _cap("callers", callers)
+        result["callees"] = _cap("callees", callees)
+        result["external_callees"] = _cap("external_callees", external)
+        result["importers"] = _cap("importers", importers)
+        result["covering_tests"] = _cap("covering_tests", sorted(covering))
+        if unresolved:
+            result["unresolved_name_matches"] = unresolved
+        if truncated:
+            result["truncated"] = truncated
+        return result
 
     def find_examples(self, topic: str, limit: int = 5) -> list[dict[str, Any]]:
         """Find indexed modules matching a role, pattern name, or path fragment."""
@@ -446,25 +642,60 @@ class GraphStore:
                 or needle in f["path"].lower()
             ):
                 matches.append(
-                    {
-                        "path": f["path"],
-                        "role": f["role"],
-                        "patterns": f["patterns"],
-                        "purpose": f["purpose"],
-                        "exposes": f["exposes"],
-                        "tests": f["tests"],
-                        "summary": f["summary"],
-                    }
+                    _compact(
+                        {
+                            "path": f["path"],
+                            "role": f["role"],
+                            "patterns": f["patterns"],
+                            "purpose": f["purpose"],
+                            "exposes": f["exposes"],
+                            "tests": f["tests"],
+                        }
+                    )
                 )
         return matches[:limit]
+
+    def files_importing(self, rel_path: str) -> list[str]:
+        """Files with an import edge that resolves to rel_path's module (or a symbol in it)."""
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT DISTINCT source_file, target FROM edges WHERE edge_type = 'imports' AND source_file != ?",
+                (rel_path,),
+            ).fetchall()
+        hits: set[str] = set()
+        for r in rows:
+            t = r["target"]
+            if module_matches(t, rel_path) or (
+                "." in t.lstrip(".") and module_matches(t.rsplit(".", 1)[0], rel_path)
+            ):
+                hits.add(r["source_file"])
+        return sorted(hits)
+
+    def tested_by(self, rel_path: str) -> list[str]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT target FROM edges WHERE source_file = ? AND edge_type = 'tested_by'",
+                (rel_path,),
+            ).fetchall()
+        return [r["target"] for r in rows]
 
     def repo_map(
         self,
         role: str | None = None,
         scope: str | None = None,
         include_summaries: bool = False,
+        depth: int | None = None,
+        limit: int = 200,
     ) -> dict[str, Any]:
-        """Return a fast, offline architectural map of indexed modules from SQLite."""
+        """Return a fast, offline architectural map of indexed modules from SQLite.
+
+        Args:
+            role / scope: Optional filters (role tag, path prefix).
+            include_summaries: Include stored module summaries.
+            depth: When set, aggregate per directory (first `depth` path segments) instead of
+                listing modules — the cheap first call on a large repo.
+            limit: Max modules listed; overflow is reported as `truncated`.
+        """
         role_needle = role.strip().lower() if role else None
         scope_needle = scope.strip().lstrip("./").rstrip("/") if scope else None
 
@@ -489,15 +720,30 @@ class GraphStore:
             }
             if include_summaries and f["summary"]:
                 entry["summary"] = f["summary"]
-            modules.append(entry)
+            modules.append(_compact(entry))
 
-        return {
+        out: dict[str, Any] = {
             "total_modules": len(modules),
             "role_filter": role_needle,
             "scope_filter": scope_needle,
             "counts_by_role": dict(sorted(counts_by_role.items())),
-            "modules": modules,
         }
+        if depth is not None and depth >= 1:
+            dirs: dict[str, dict[str, Any]] = {}
+            for m in modules:
+                parts = m["path"].split("/")[:-1]
+                key = "/".join(parts[:depth]) or "."
+                bucket = dirs.setdefault(key, {"modules": 0, "lines": 0, "roles": {}})
+                bucket["modules"] += 1
+                bucket["lines"] += m.get("line_count", 0)
+                bucket["roles"][m["role"]] = bucket["roles"].get(m["role"], 0) + 1
+            out["directories"] = dict(sorted(dirs.items()))
+            return out
+        out["modules"] = modules[:limit]
+        if len(modules) > limit:
+            out["truncated"] = len(modules) - limit
+            out["hint"] = "Narrow with scope=/role=, or call repo_map(depth=1) for a directory overview."
+        return out
 
     def stats(self) -> dict[str, int]:
         with self._connect() as conn:

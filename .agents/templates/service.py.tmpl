@@ -1,0 +1,24 @@
+{header}
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+
+
+@dataclass
+class {class_name}:
+    """TODO: one-line purpose. Inject repositories/clients as constructor fields."""
+
+    def run(self) -> None:
+        """TODO: describe params, return value, and side effects."""
+        raise NotImplementedError
+
+
+class {class_name}Error(Exception):
+    """Domain error with a machine-readable code and a safe user-facing message."""
+
+    def __init__(self, code: str, message: str, status_code: int = 400) -> None:
+        super().__init__(message)
+        self.code = code
+        self.message = message
+        self.status_code = status_code

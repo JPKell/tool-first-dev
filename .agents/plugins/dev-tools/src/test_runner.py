@@ -1,4 +1,10 @@
-"""Compact failure-only test runner and header/ruff lint runner."""
+"""
+Purpose: Compact failure-only test runner (pytest or a configured JS command) and header/Ruff linter.
+Role: service
+Patterns: service-layer
+Tests: tests/test_toolkit.py, tests/test_navigation.py
+Invariants: Output is bounded (failures only, truncated messages); timeouts return, never raise.
+"""
 
 from __future__ import annotations
 
@@ -13,6 +19,10 @@ from typing import Any
 
 from .config import ToolkitConfig, load_config
 from .headers import parse_and_validate_header
+from .parser import parse_file
+
+JS_TEST_EXTS = (".js", ".mjs", ".cjs", ".jsx", ".ts", ".tsx")
+TAIL_LINES = 30
 
 SUMMARY_RE = re.compile(
     r"(?:(?P<failed>\d+)\s+failed)?"
@@ -94,39 +104,93 @@ def _parse_pytest_failures(output: str) -> list[dict[str, Any]]:
     return failures
 
 
+def _run_js_tests(cfg: ToolkitConfig, targets: list[str]) -> dict[str, Any]:
+    """Run the configured `tests.js_command` and return exit status plus a bounded output tail."""
+    js_cmd = cfg.tests.get("js_command")
+    if not js_cmd:
+        return {
+            "ok": False,
+            "status": "not_configured",
+            "scope": " ".join(targets),
+            "note": 'Set "tests": {"js_command": ["npx", "vitest", "run"]} in .agents/config.json.',
+        }
+    t0 = time.monotonic()
+    try:
+        proc = subprocess.run(
+            [*js_cmd, *targets],
+            cwd=cfg.project_root,
+            capture_output=True,
+            text=True,
+            timeout=cfg.test_timeout_s,
+        )
+    except subprocess.TimeoutExpired:
+        return {"ok": False, "status": "timeout", "scope": " ".join(targets), "timeout_s": cfg.test_timeout_s}
+    combined = (proc.stdout or "") + ("\n" + proc.stderr if proc.stderr else "")
+    tail = [ln.rstrip() for ln in combined.splitlines() if ln.strip()][-TAIL_LINES:]
+    return {
+        "ok": proc.returncode == 0,
+        "exit_code": proc.returncode,
+        "scope": " ".join(targets),
+        "duration_s": round(time.monotonic() - t0, 3),
+        "output_tail": [] if proc.returncode == 0 else tail,
+    }
+
+
 def run_compact_tests(
     scope: str | None = None,
     config: ToolkitConfig | None = None,
 ) -> dict[str, Any]:
-    """Run pytest and return compact machine-readable results (failures only)."""
+    """Run tests and return compact machine-readable results (failures only).
+
+    Args:
+        scope: One or more space-separated test paths / node ids (default: `tests`). JS test
+            files are routed to `tests.js_command` from .agents/config.json.
+        config: Toolkit config (loaded from PROJECT_ROOT when omitted).
+    Returns:
+        {ok, status?, exit_code, passed, failed, errors, skipped, duration_s, failures}.
+    """
     cfg = config or load_config()
-    target = scope.strip() if scope else "tests"
-    target_path = cfg.project_root / target.split("::")[0]
-    if not target_path.exists():
+    requested = scope.split() if scope and scope.strip() else ["tests"]
+    targets = [t for t in requested if (cfg.project_root / t.split("::")[0]).exists()]
+    missing = [t for t in requested if t not in targets]
+    if not targets:
         return {
             "ok": True,
             "status": "no_tests_yet",
-            "scope": target,
-            "python": _select_python(cfg),
+            "scope": " ".join(requested),
             "passed": 0,
             "failed": 0,
             "errors": 0,
             "skipped": 0,
             "duration_s": 0.0,
             "failures": [],
-            "note": f"Test path '{target}' does not exist yet.",
+            "note": f"Test path(s) {', '.join(requested)} do not exist yet.",
         }
 
+    js_targets = [t for t in targets if t.split("::")[0].endswith(JS_TEST_EXTS)]
+    if js_targets and len(js_targets) == len(targets):
+        return _run_js_tests(cfg, js_targets)
+
+    target = " ".join(targets)
     py = _select_python(cfg)
-    cmd = [py, "-m", "pytest", target, "-q", "--tb=short", "--no-header"]
+    cmd = [py, "-m", "pytest", *targets, "-q", "--tb=short", "--no-header", "-p", "no:cacheprovider"]
     t0 = time.monotonic()
-    proc = subprocess.run(
-        cmd,
-        cwd=cfg.project_root,
-        capture_output=True,
-        text=True,
-        timeout=120,
-    )
+    try:
+        proc = subprocess.run(
+            cmd,
+            cwd=cfg.project_root,
+            capture_output=True,
+            text=True,
+            timeout=cfg.test_timeout_s,
+        )
+    except subprocess.TimeoutExpired:
+        return {
+            "ok": False,
+            "status": "timeout",
+            "scope": target,
+            "timeout_s": cfg.test_timeout_s,
+            "note": "Narrow the scope or raise tests.timeout_s in .agents/config.json.",
+        }
     duration = round(time.monotonic() - t0, 3)
     combined = (proc.stdout or "") + ("\n" + proc.stderr if proc.stderr else "")
 
@@ -150,7 +214,7 @@ def run_compact_tests(
         tail = [ln.strip() for ln in combined.splitlines() if ln.strip()][-6:]
         failures.append({"test": target, "file": "", "line": None, "error": " | ".join(tail)[:400]})
 
-    return {
+    result = {
         "ok": proc.returncode in (0, 5),
         "exit_code": proc.returncode,
         "scope": target,
@@ -162,6 +226,9 @@ def run_compact_tests(
         "duration_s": duration,
         "failures": failures,
     }
+    if missing:
+        result["missing_scopes"] = missing
+    return result
 
 
 def run_lint_and_headers(
@@ -177,7 +244,7 @@ def run_lint_and_headers(
     for rel in files:
         full = cfg.project_root / rel
         source = full.read_text(encoding="utf-8", errors="ignore")
-        header = parse_and_validate_header(rel, source, cfg)
+        header = parse_and_validate_header(rel, source, cfg, parsed=parse_file(rel, source))
         if not header.is_valid:
             header_issues.append({"file": rel.as_posix(), "errors": header.errors})
         if rel.suffix == ".py":

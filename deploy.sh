@@ -288,6 +288,10 @@ print(" ", copy_or_write("CLAUDE.md"))
 print(" ", copy_or_write(".mcp.json"))
 print(" ", copy_or_write(".env.example"))
 print(" ", copy_or_write(".agents/RULES.md"))
+# Role starter templates for scaffold_module (project-owned: never overwritten unless requested)
+for tmpl in sorted((src / ".agents/templates").glob("*")):
+    if tmpl.is_file():
+        print(" ", copy_or_write(f".agents/templates/{tmpl.name}"))
 
 # 3. Customize .agents/config.json
 cfg = json.loads((src / ".agents/config.json").read_text(encoding="utf-8"))
@@ -393,6 +397,6 @@ bold "=== Done! Next Steps ==="
 info "1. Paste the section from $TARGET_DIR/.agents/PLAN_TOOLING_SECTION.md into your initial plan."
 info "2. Review $TARGET_DIR/.agents/RULES.md to add any project-specific patterns or boundaries."
 info "3. Per-agent first run:"
-info "   - Antigravity: open $TARGET_DIR and check /mcp (all 9 project-dev tools load eagerly)."
+info "   - Antigravity: open $TARGET_DIR and check /mcp (all 14 project-dev tools load eagerly)."
 info "   - Claude Code: run 'claude' in $TARGET_DIR once to approve .mcp.json's project-dev server."
 info "   - Codex CLI:   run 'codex mcp list' in $TARGET_DIR to confirm project-dev is active."

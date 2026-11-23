@@ -47,15 +47,20 @@ Tests are written before or alongside implementation, linked via the module's `T
 ## 3. Documentation Contract
 
 ### Module Header (Required)
-Every source file inside `header_required_dirs` (configured in `.agents/config.json`) must begin with a structured header containing all required fields:
+Every source file inside `header_required_dirs` (configured in `.agents/config.json`) must begin with a structured header. The fields only a human/agent can supply are required (`required_header_fields`):
 
 - **Purpose** — One clear sentence describing what the module does.
 - **Role** — Exactly one tag from the Role Vocabulary above.
 - **Patterns** — Comma-separated list of pattern names from Section 2 (or `none` for trivial utilities).
-- **Depends on** — Key internal/external modules this file imports (or `none`).
-- **Exposes** — Public classes, functions, or routes exported by this module.
-- **Tests** — Relative path(s) to covering test file(s) (or `none` only for pure entrypoints/templates).
+- **Tests** — Relative path(s) to covering test file(s) (or `none` only for pure entrypoints/templates). Each path must exist.
 - **Invariants** — Key assumptions or constraints that must remain true (or `none`).
+
+Fields the code already knows are derived from the AST when omitted:
+
+- **Exposes** — Public top-level classes/functions. If written, every name must be defined in the module (free-form entries such as routes, e.g. `GET /users`, are not checked).
+- **Depends on** — Imported modules.
+
+`lint_and_headers` reports **header drift** (an `Exposes` name that no longer exists, or a missing `Tests:` path) so headers cannot silently go stale. `scaffold_module` writes a valid header for you.
 
 ### Function & Class Docstrings
 Public functions and classes should concisely document:

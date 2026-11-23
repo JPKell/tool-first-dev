@@ -1,4 +1,10 @@
-"""OpenWeightGym API client for knowledge-graph embeddings and module summaries."""
+"""
+Purpose: OpenWeightGym HTTP client for knowledge-graph embeddings and module summaries.
+Role: service
+Patterns: structured-errors
+Tests: tests/test_toolkit.py
+Invariants: Never logs the API key; failures raise OWGError (HTTP) or httpx.TransportError.
+"""
 
 from __future__ import annotations
 

@@ -8,15 +8,48 @@
       ],
       "timeoutSeconds": 300,
       "tools": {
-        "repo_map": { "eager": true },
-        "lookup_symbol": { "eager": true },
-        "find_similar": { "eager": true },
-        "get_conventions": { "eager": true },
-        "run_tests": { "eager": true },
-        "lint_and_headers": { "eager": true },
-        "index_status": { "eager": true },
-        "reindex": { "eager": true },
-        "tool_metrics": { "eager": true }
+        "repo_map": {
+          "eager": true
+        },
+        "outline": {
+          "eager": true
+        },
+        "get_source": {
+          "eager": true
+        },
+        "lookup_symbol": {
+          "eager": true
+        },
+        "search_text": {
+          "eager": true
+        },
+        "find_similar": {
+          "eager": true
+        },
+        "get_conventions": {
+          "eager": true
+        },
+        "scaffold_module": {
+          "eager": true
+        },
+        "run_tests": {
+          "eager": true
+        },
+        "affected_tests": {
+          "eager": true
+        },
+        "lint_and_headers": {
+          "eager": true
+        },
+        "index_status": {
+          "eager": true
+        },
+        "reindex": {
+          "eager": true
+        },
+        "tool_metrics": {
+          "eager": true
+        }
       }
     }
   }

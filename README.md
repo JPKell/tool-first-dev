@@ -3,9 +3,18 @@
 A reusable, project-agnostic **Tool-First Development** starter kit for **Google Antigravity (`agy`)**, **Claude Code (`claude`)**, and **OpenAI Codex (`codex`)**.
 
 It bundles:
-- **Shared `project-dev` MCP server** (`.agents/plugins/dev-tools/`) backed by a local SQLite knowledge graph (Tree-sitter AST + call graph + OpenWeightGym summaries & dense embeddings).
-- **9 eager-loaded MCP tools**: `repo_map`, `get_conventions`, `find_similar`, `lookup_symbol`, `run_tests`, `lint_and_headers`, `index_status`, `reindex`, and `tool_metrics`.
-- **Multi-agent lifecycle hooks**: `PreToolUse` guardrails (blocks hand-editing `.agents/state/` or `.env`, blocks raw shell `pytest`/`ruff`), `PostToolUse` local AST sync + adoption telemetry, and `Stop` hook incremental OWG sync.
+- **Shared `project-dev` MCP server** (`.agents/plugins/dev-tools/`) backed by a local SQLite knowledge graph (Tree-sitter AST + import-resolved call graph, with optional OpenWeightGym summaries & dense embeddings and an offline BM25 fallback).
+- **14 eager-loaded MCP tools**, all returning compact, size-bounded JSON:
+
+  | Need | Tool |
+  |---|---|
+  | Orient | `repo_map` (`depth=1` for a directory overview), `get_conventions` |
+  | Read less | `outline` (signatures + line ranges, no bodies), `get_source` (one symbol's exact body) |
+  | Find | `lookup_symbol` (import-resolved callers/callees/importers/tests), `search_text` (grep replacement), `find_similar` |
+  | Create | `scaffold_module` (module + linked test from `.agents/templates/`, valid header) |
+  | Verify | `run_tests`, `affected_tests` (only tests covering changed files), `lint_and_headers` (Ruff + header drift) |
+  | Maintain | `index_status`, `reindex`, `tool_metrics` (adoption + estimated tokens saved) |
+- **Multi-agent lifecycle hooks**: `PreToolUse` guardrails (blocks editing `.agents/state/` or `.env` — including via shell redirects/`sed -i`/`rm` — and raw shell `pytest`/`ruff`), `PostToolUse` local AST sync after Write/Edit *and* shell edits + adoption telemetry, and a `Stop` hook OWG sync with a 10-minute circuit breaker after connection failures. Hooks fail open silently until `setup.sh` has created the toolkit venv.
 - **Root agent docs & configs**: `AGENTS.md`, `CLAUDE.md` (`@AGENTS.md`), `.mcp.json`, `.claude/settings.json`, `.codex/config.toml`, `.codex/hooks.json`, `.agents/RULES.md`, `.agents/PLAN_TOOLING_SECTION.md`, and an optional multi-agent `DevDockerfile`.
 
 ---
@@ -39,7 +48,7 @@ Copy the section in `.agents/PLAN_TOOLING_SECTION.md` directly into your new pro
 ## Per-Agent First-Run Checklist
 
 After `./deploy.sh` finishes:
-- **Antigravity (`agy`)**: Open the target repo and run `/mcp` — all 9 `dev-tools_project-dev` tools load under `Eager`.
+- **Antigravity (`agy`)**: Open the target repo and run `/mcp` — all 14 `dev-tools_project-dev` tools load under `Eager`.
 - **Claude Code (`claude`)**: Launch `claude` once in the target repo and approve `.mcp.json`'s `project-dev` server (`.claude/settings.json` pre-configures `ENABLE_TOOL_SEARCH=false` and `mcp__project-dev__*` permissions).
 - **Codex (`codex`)**: If you answered `y` to trusting the repo in `~/.codex/config.toml`, Codex automatically loads `.codex/config.toml` and `.codex/hooks.json`. Run `codex mcp list` in the target repo to verify.
 
@@ -50,5 +59,19 @@ After `./deploy.sh` finishes:
 ```bash
 cd ~/repos/tool-first-dev/.agents/plugins/dev-tools
 ./setup.sh  # or use an existing venv with dev-tools dependencies
-PYTHONPATH=. .venv/bin/pytest -q tests/test_toolkit.py
+PYTHONPATH=. .venv/bin/pytest -q tests/
 ```
+
+`tests/test_navigation.py` includes a dogfooding test: the toolkit's own `src/` must pass its header, drift, and Ruff rules.
+
+---
+
+## Measuring Whether Tool-First Helps
+
+- **In-session:** `tool_metrics` reports `est_tokens_returned` and `est_tokens_saved` (bytes of files the agent would otherwise have read, minus the tool payload, ÷ 4). Treat these as rough estimates.
+- **A/B benchmark:** `.agents/plugins/dev-tools/bench/compare.py` runs the same task prompt headlessly with `claude -p` in two throwaway git worktrees, once with the `project-dev` server + hooks and once without, and compares turns, cost, and token usage from the JSON output:
+
+  ```bash
+  python3 .agents/plugins/dev-tools/bench/compare.py --repo ~/repos/my-project \
+      --task "Add a discount field to BillingService.total and cover it with a test" --runs 3
+  ```

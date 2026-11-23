@@ -1,0 +1,19 @@
+{header}
+
+from __future__ import annotations
+
+import sqlite3
+from typing import Any
+
+
+class {class_name}:
+    """TODO: one-line purpose. Owns every storage statement for this aggregate."""
+
+    def __init__(self, conn: sqlite3.Connection) -> None:
+        self._conn = conn
+
+    def get(self, item_id: int) -> dict[str, Any] | None:
+        """Fetch one row by id with a parameterized query. Side effects: none (read-only)."""
+        # TODO: replace `items` with the real table.
+        row = self._conn.execute("SELECT * FROM items WHERE id = ?", (item_id,)).fetchone()
+        return dict(row) if row else None

@@ -6,7 +6,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": ".agents/plugins/dev-tools/run_hook.sh pre_tool",
+            "command": "\"$(git rev-parse --show-toplevel 2>/dev/null || pwd)\"/.agents/plugins/dev-tools/run_hook.sh pre_tool",
             "timeout": 10
           }
         ]
@@ -18,7 +18,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": ".agents/plugins/dev-tools/run_hook.sh post_tool",
+            "command": "\"$(git rev-parse --show-toplevel 2>/dev/null || pwd)\"/.agents/plugins/dev-tools/run_hook.sh post_tool",
             "timeout": 15
           }
         ]
@@ -29,7 +29,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": ".agents/plugins/dev-tools/run_hook.sh stop",
+            "command": "\"$(git rev-parse --show-toplevel 2>/dev/null || pwd)\"/.agents/plugins/dev-tools/run_hook.sh stop",
             "timeout": 60
           }
         ]

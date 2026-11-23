@@ -442,7 +442,7 @@ def test_non_mcp_tool_usage_logging_and_metrics(tmp_path: Path) -> None:
     # Record 0: unguided read -> flagged
     assert records[0]["tool"] == "read_file"
     assert records[0]["is_indexed_source"] is True
-    assert records[0]["suggested_mcp_tool"] == "repo_map / lookup_symbol / find_similar"
+    assert records[0]["suggested_mcp_tool"] == "outline / get_source / lookup_symbol"
     assert records[0]["conversation_id"] == "conv-1"
     assert records[0]["followed_mcp_tool"] is None
 
@@ -453,7 +453,7 @@ def test_non_mcp_tool_usage_logging_and_metrics(tmp_path: Path) -> None:
     assert records[1]["suggested_mcp_tool"] is None
 
     assert records[2]["suggested_mcp_tool"] == "get_conventions"
-    assert records[3]["suggested_mcp_tool"] == "lookup_symbol / find_similar"
+    assert records[3]["suggested_mcp_tool"] == "search_text / lookup_symbol"
     assert records[4]["suggested_mcp_tool"] is None
     assert records[5]["tool"] == "search_web"
     assert records[6]["hook"] == "pre_tool_blocked"
@@ -577,6 +577,11 @@ def test_mcp_server_instructions_and_agent_configs() -> None:
         "run_tests",
         "lint_and_headers",
         "index_status",
+        "outline",
+        "get_source",
+        "search_text",
+        "affected_tests",
+        "scaffold_module",
     ):
         assert server_cfg["tools"][tool_name]["eager"] is True
 
@@ -608,8 +613,42 @@ def test_mcp_server_instructions_and_agent_configs() -> None:
         "lint_and_headers",
         "index_status",
         "tool_metrics",
+        "outline",
+        "get_source",
+        "search_text",
+        "affected_tests",
+        "scaffold_module",
     ):
         assert tok in plan_doc
+
+
+def test_hook_commands_resolve_from_any_cwd_and_fail_open_without_venv(tmp_path: Path) -> None:
+    repo_root = Path(__file__).resolve().parents[4]
+
+    # Hook commands must not depend on the shell's current directory
+    for rel in (".claude/settings.json", ".codex/hooks.json"):
+        hooks = json.loads((repo_root / rel).read_text(encoding="utf-8"))["hooks"]
+        for groups in hooks.values():
+            for group in groups:
+                for hook in group["hooks"]:
+                    cmd = hook["command"]
+                    assert not cmd.startswith(".agents/"), f"{rel}: relative hook command {cmd!r}"
+                    assert "run_hook.sh" in cmd
+
+    # run_hook.sh must exit 0 quietly (no hook error spam) when the toolkit venv is missing
+    script = repo_root / ".agents/plugins/dev-tools/run_hook.sh"
+    proc = subprocess.run(
+        [str(script), "post_tool"],
+        cwd=tmp_path,
+        input="{}",
+        capture_output=True,
+        text=True,
+        timeout=20,
+        env={"PATH": "/usr/bin:/bin", "DEV_TOOLS_PYTHON": str(tmp_path / "missing/python")},
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert proc.stderr == ""
+    assert json.loads(proc.stdout.strip()) == {}
 
 
 def test_repo_map_and_bounded_concurrent_summarization(tmp_path: Path) -> None:
